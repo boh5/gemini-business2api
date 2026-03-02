@@ -137,164 +137,144 @@ class DuckMailClient:
         return False
 
     def fetch_verification_code(self, since_time=None) -> Optional[str]:
-        """获取验证码"""
+        """获取验证码（与参考项目 Gemini-Business 对齐）"""
         if not self.token:
-            self._log("info", "🔐 Token 不存在，尝试重新登录...")
+            self._log("info", "Token 不存在，尝试重新登录...")
             if not self.login():
-                self._log("error", "❌ 登录失败，无法获取验证码")
+                self._log("error", "登录失败，无法获取验证码")
                 return None
 
         try:
-            self._log("info", "📬 正在拉取邮件列表...")
-            # 获取邮件列表
+            # 获取邮件列表（带 Accept header，与参考项目一致）
+            headers = {
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/json",
+            }
             res = self._request(
                 "GET",
                 f"{self.base_url}/messages",
-                headers={"Authorization": f"Bearer {self.token}"},
+                headers=headers,
+                timeout=8,
             )
 
             if res.status_code != 200:
-                self._log("error", f"❌ 获取邮件列表失败: HTTP {res.status_code}")
+                self._log("error", f"获取邮件列表失败: HTTP {res.status_code}")
                 return None
 
             data = res.json() if res.content else {}
-            messages = data.get("hydra:member", [])
+            # 兼容多种 API 响应格式
+            messages = (
+                data.get("hydra:member")
+                or data.get("member")
+                or data.get("data")
+                or []
+            )
 
             if not messages:
-                self._log("info", "📭 邮箱为空，暂无邮件")
                 return None
 
-            self._log("info", f"📨 收到 {len(messages)} 封邮件，开始检查验证码...")
+            self._log("info", f"收到 {len(messages)} 封邮件")
 
-            from datetime import datetime
-            import re
+            # 与参考项目一致：直接取第一封邮件（最新的）
+            msg = messages[0]
 
-            def _parse_message_time(msg_obj) -> Optional[datetime]:
-                created_at = msg_obj.get("createdAt")
-                if created_at is None:
-                    return None
+            # 调试：打印消息原始数据帮助排查
+            self._log("info", f"消息原始字段: {list(msg.keys())}")
 
-                if isinstance(created_at, (int, float)):
-                    timestamp = float(created_at)
-                    if timestamp > 1e12:
-                        timestamp = timestamp / 1000.0
-                    return datetime.fromtimestamp(timestamp).astimezone().replace(tzinfo=None)
-
-                if isinstance(created_at, str):
-                    raw = created_at.strip()
-                    if not raw:
-                        return None
-                    if raw.isdigit():
-                        timestamp = float(raw)
-                        if timestamp > 1e12:
-                            timestamp = timestamp / 1000.0
-                        return datetime.fromtimestamp(timestamp).astimezone().replace(tzinfo=None)
-
-                    # 截断纳秒到微秒（fromisoformat 只支持6位小数）
-                    raw = re.sub(r"(\.\d{6})\d+", r"\1", raw)
-                    return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
-
+            msg_id = msg.get("id") or msg.get("@id")
+            if not msg_id:
+                self._log("error", f"消息中无 id 字段，原始数据: {str(msg)[:300]}")
                 return None
 
-            # 按时间倒序，优先检查最新邮件
-            messages_with_time = [(msg, _parse_message_time(msg)) for msg in messages]
-            if any(item[1] is not None for item in messages_with_time):
-                messages_with_time.sort(key=lambda item: item[1] or datetime.min, reverse=True)
-                messages = [item[0] for item in messages_with_time]
+            # Hydra 格式: @id 为 "/messages/123"，提取纯 ID
+            if isinstance(msg_id, str) and msg_id.startswith("/messages/"):
+                msg_id = msg_id.split("/")[-1]
 
-            # 遍历邮件，过滤时间
-            for idx, msg in enumerate(messages, 1):
-                msg_id = msg.get("id")
-                if not msg_id:
-                    continue
+            self._log("info", f"正在读取邮件详情 (ID: {msg_id})")
+            detail = self._request(
+                "GET",
+                f"{self.base_url}/messages/{msg_id}",
+                headers=headers,
+                timeout=8,
+            )
 
-                # 时间过滤
-                if since_time:
-                    msg_time = _parse_message_time(msg)
-                    if msg_time and msg_time < since_time:
-                        continue
+            if detail.status_code != 200:
+                self._log("warning", f"读取邮件详情失败: HTTP {detail.status_code}")
+                return None
 
-                self._log("info", f"🔍 正在读取邮件 {idx}/{len(messages)} (ID: {msg_id[:10]}...)")
-                detail = self._request(
-                    "GET",
-                    f"{self.base_url}/messages/{msg_id}",
-                    headers={"Authorization": f"Bearer {self.token}"},
-                )
+            payload = detail.json() if detail.content else {}
 
-                if detail.status_code != 200:
-                    self._log("warning", f"⚠️ 读取邮件详情失败: HTTP {detail.status_code}")
-                    continue
+            # 获取邮件内容
+            text_content = payload.get("text") or ""
+            html_content = payload.get("html") or ""
 
-                payload = detail.json() if detail.content else {}
+            # html/text 字段可能是 list
+            if isinstance(html_content, list):
+                html_content = html_content[0] if html_content else ""
+            if isinstance(text_content, list):
+                text_content = text_content[0] if text_content else ""
 
-                # 获取邮件内容
-                text_content = payload.get("text") or ""
-                html_content = payload.get("html") or ""
+            # 调试日志：打印邮件内容帮助排查
+            self._log("info", f"邮件 text 字段 ({len(text_content)} 字符): {text_content[:500] if text_content else '(空)'}")
 
-                if isinstance(html_content, list):
-                    html_content = "".join(str(item) for item in html_content)
-                if isinstance(text_content, list):
-                    text_content = "".join(str(item) for item in text_content)
+            # 与参考项目一致：分别在 text 和 html 中提取验证码
+            code = extract_verification_code(text_content) or extract_verification_code(html_content)
+            if code:
+                self._log("info", f"找到验证码: {code}")
+                return code
+            else:
+                self._log("warning", "邮件中未找到验证码")
 
-                content = text_content + html_content
-                self._log("info", f"📄 邮件内容预览: {content[:200]}...")
-
-                code = extract_verification_code(content)
-                if code:
-                    self._log("info", f"✅ 找到验证码: {code}")
-                    return code
-                else:
-                    self._log("info", f"❌ 邮件 {idx} 中未找到验证码")
-
-            self._log("warning", "⚠️ 所有邮件中均未找到验证码")
             return None
 
         except Exception as e:
-            self._log("error", f"❌ 获取验证码异常: {e}")
+            self._log("error", f"获取验证码异常: {e}")
             return None
 
     def poll_for_code(
         self,
-        timeout: int = 120,
-        interval: int = 4,
+        timeout: int = 90,
+        interval: int = 3,
         since_time=None,
     ) -> Optional[str]:
-        """轮询获取验证码"""
+        """轮询获取验证码（与参考项目 Gemini-Business 对齐）"""
         if not self.token:
-            self._log("info", "🔐 Token 不存在，尝试登录...")
+            self._log("info", "Token 不存在，尝试登录...")
             if not self.login():
-                self._log("error", "❌ 登录失败，无法轮询验证码")
+                self._log("error", "登录失败，无法轮询验证码")
                 return None
 
-        max_retries = max(1, timeout // interval)
-        self._log("info", f"⏱️ 开始轮询验证码 (超时 {timeout}秒, 间隔 {interval}秒, 最多 {max_retries} 次)")
-
-        for i in range(1, max_retries + 1):
-            self._log("info", f"🔄 第 {i}/{max_retries} 次轮询...")
+        start = time.time()
+        while time.time() - start < timeout:
+            elapsed = int(time.time() - start)
             code = self.fetch_verification_code(since_time=since_time)
             if code:
-                self._log("info", f"🎉 验证码获取成功: {code}")
+                self._log("info", f"验证码获取成功: {code}")
                 return code
+            if elapsed % 15 == 0 and elapsed > 0:
+                self._log("info", f"[{elapsed}s] 仍在等待验证码...")
+            time.sleep(interval)
 
-            if i < max_retries:
-                self._log("info", f"⏳ 等待 {interval} 秒后重试...")
-                time.sleep(interval)
-
-        self._log("error", f"⏰ 验证码获取超时 ({timeout}秒)")
+        self._log("error", f"验证码获取超时 ({timeout}秒)")
         return None
 
     def _get_domain(self) -> str:
-        """获取可用域名"""
+        """获取可用域名（优先使用 duckmail.sbs，与参考项目一致）"""
         try:
             res = self._request("GET", f"{self.base_url}/domains")
             if res.status_code == 200:
                 data = res.json() if res.content else {}
                 members = data.get("hydra:member", [])
                 if members:
-                    return members[0].get("domain") or "duck.com"
+                    domains = [m.get("domain") for m in members if m.get("domain")]
+                    # 优先选择 duckmail.sbs（参考项目验证可用）
+                    for preferred in ("duckmail.sbs",):
+                        if preferred in domains:
+                            return preferred
+                    return domains[0] if domains else "duckmail.sbs"
         except Exception:
             pass
-        return "duck.com"
+        return "duckmail.sbs"
 
     def _log(self, level: str, message: str) -> None:
         if self.log_callback:
