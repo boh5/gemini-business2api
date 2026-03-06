@@ -30,6 +30,8 @@ XPATH = {
 CHROMIUM_PATHS = [
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
+    "/usr/lib/chromium/chromium",
+    "/opt/google/chrome/google-chrome",
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
 ]
@@ -51,6 +53,11 @@ def _find_chromium_path() -> Optional[str]:
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
     return None
+
+
+def _has_graphical_session() -> bool:
+    """当前环境是否具备可用的图形会话。"""
+    return bool((os.environ.get("DISPLAY") or "").strip() or (os.environ.get("WAYLAND_DISPLAY") or "").strip())
 
 
 class GeminiAutomation:
@@ -107,7 +114,30 @@ class GeminiAutomation:
             self._user_data_dir = None
 
     def _create_page(self) -> ChromiumPage:
-        """创建浏览器页面（与参考项目对齐：尽量少设参数，减少自动化指纹）"""
+        """创建浏览器页面，并在 Linux/无显示环境下做稳妥回退。"""
+        effective_headless = self.headless
+        if not effective_headless and not _has_graphical_session():
+            effective_headless = True
+            self._log("warning", "未检测到图形会话，自动切换为无头模式启动浏览器")
+
+        try:
+            return self._launch_page(effective_headless)
+        except Exception as exc:
+            if self.headless or effective_headless:
+                raise
+            self._log("warning", f"有头模式启动失败，自动切换无头模式重试: {exc}")
+            return self._launch_page(True)
+
+    def _launch_page(self, headless: bool) -> ChromiumPage:
+        """按指定模式启动浏览器。"""
+        options = self._build_browser_options(headless)
+        page = ChromiumPage(options)
+        page.set.timeouts(self.timeout)
+
+        return page
+
+    def _build_browser_options(self, headless: bool) -> ChromiumOptions:
+        """构建浏览器启动参数。"""
         options = ChromiumOptions()
 
         # 自动检测 Chromium 浏览器路径（Linux/Docker 环境）
@@ -118,20 +148,20 @@ class GeminiAutomation:
         # 仅保留 Docker/Linux 环境必需的参数（参考项目零参数启动）
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
+        options.set_argument("--disable-setuid-sandbox")
+        options.set_argument("--no-first-run")
+        options.set_argument("--no-default-browser-check")
+        options.set_argument("--window-size=1920,1080")
 
         if self.proxy:
             options.set_argument(f"--proxy-server={self.proxy}")
 
-        if self.headless:
+        if headless:
             options.set_argument("--headless=new")
             options.set_argument("--disable-gpu")
-            options.set_argument("--window-size=1920,1080")
 
         options.auto_port()
-        page = ChromiumPage(options)
-        page.set.timeouts(self.timeout)
-
-        return page
+        return options
 
     def _fast_type(self, element, text: str, delay: float = 0.02) -> None:
         """快速逐字符输入文本（与 Gemini-Business 脚本一致）"""
